@@ -1,266 +1,314 @@
-import { useState, useEffect } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type FormEvent,
+  type KeyboardEvent,
+} from "react";
 import { useNavigate } from "react-router-dom";
-import { signInWithEmailAndPassword } from "firebase/auth";
+import { signInWithEmailAndPassword, onAuthStateChanged } from "firebase/auth";
+import type { FirebaseError } from "firebase/app";
+import { AlertCircle, Eye, EyeOff, Loader2 } from "lucide-react";
 import { auth } from "../firebase/firebase";
-import { Eye, EyeOff, Shield, AlertCircle } from "lucide-react";
 import adminLogo from "../assets/images/admin-login.png";
+
+const DASHBOARD_PATH = "/admin/dashboard";
+const MAX_ATTEMPTS = 3;
+const LOCK_SECONDS = 30;
+const LOCK_KEY = "admin_login_locked_until";
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const YEAR = new Date().getFullYear();
+
+// Wrong email and wrong password share one message so the form
+// never reveals which accounts exist.
+const CREDENTIAL_ERRORS = new Set([
+  "auth/invalid-credential",
+  "auth/user-not-found",
+  "auth/wrong-password",
+]);
+
+const ERROR_MESSAGES: Record<string, string> = {
+  "auth/invalid-email": "Enter a valid email address.",
+  "auth/user-disabled": "This account has been disabled. Contact a super admin.",
+  "auth/too-many-requests": "Too many attempts. Wait a few minutes and try again.",
+  "auth/network-request-failed": "No connection. Check your internet and try again.",
+};
+
+const DEFAULT_ERROR = "Incorrect email or password.";
+const FALLBACK_ERROR = "Something went wrong. Please try again.";
+
+type Field = "email" | "password";
+type FormErrors = Partial<Record<Field | "general", string>>;
+
+// localStorage can throw (private mode, blocked storage), so keep it guarded.
+const readLock = (): number | null => {
+  try {
+    const until = Number(localStorage.getItem(LOCK_KEY));
+    return until > Date.now() ? until : null;
+  } catch {
+    return null;
+  }
+};
+
+const writeLock = (until: number | null) => {
+  try {
+    if (until) localStorage.setItem(LOCK_KEY, String(until));
+    else localStorage.removeItem(LOCK_KEY);
+  } catch {
+    /* storage unavailable, lock still works for this session */
+  }
+};
+
+const validate = (email: string, password: string): FormErrors => {
+  const errors: FormErrors = {};
+  if (!email) errors.email = "Enter your email address.";
+  else if (!EMAIL_REGEX.test(email)) errors.email = "Enter a valid email address.";
+  if (!password) errors.password = "Enter your password.";
+  return errors;
+};
+
+const inputClass = (hasError: boolean) =>
+  `w-full rounded-lg border bg-white px-3.5 py-2.5 text-sm text-slate-900 placeholder:text-slate-400
+   outline-none transition focus:ring-2 disabled:cursor-not-allowed disabled:bg-slate-50 ${
+     hasError
+       ? "border-red-400 focus:border-red-500 focus:ring-red-200"
+       : "border-slate-300 focus:border-indigo-500 focus:ring-indigo-200"
+   }`;
 
 export default function AdminLogin() {
   const navigate = useNavigate();
+  const emailRef = useRef<HTMLInputElement>(null);
+  const passwordRef = useRef<HTMLInputElement>(null);
+
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
+  const [capsLock, setCapsLock] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [errors, setErrors] = useState<{ email?: string; password?: string; general?: string }>({});
-  const [loginAttempts, setLoginAttempts] = useState(0);
+  const [checkingAuth, setCheckingAuth] = useState(true);
+  const [errors, setErrors] = useState<FormErrors>({});
+  const [attempts, setAttempts] = useState(0);
+  const [lockedUntil, setLockedUntil] = useState<number | null>(readLock);
+  const [now, setNow] = useState(Date.now);
 
-  // Reset errors when user types
+  const isLocked = lockedUntil !== null && now < lockedUntil;
+  const secondsLeft = isLocked ? Math.ceil((lockedUntil - now) / 1000) : 0;
+
+  // Already signed in (or just signed in): go straight to the dashboard.
   useEffect(() => {
-    if (errors.email || errors.password) {
-      setErrors({});
-    }
-  }, [email, password]);
+    return onAuthStateChanged(auth, (user) => {
+      if (user) navigate(DASHBOARD_PATH, { replace: true });
+      else setCheckingAuth(false);
+    });
+  }, [navigate]);
 
-  const validateForm = () => {
-    const newErrors: { email?: string; password?: string } = {};
+  // Tick once per second, only while a lock is active.
+  useEffect(() => {
+    if (!lockedUntil) return;
+    setNow(Date.now());
+    const id = setInterval(() => {
+      const t = Date.now();
+      setNow(t);
+      if (t >= lockedUntil) {
+        clearInterval(id);
+        setLockedUntil(null);
+        setAttempts(0);
+        writeLock(null);
+      }
+    }, 1000);
+    return () => clearInterval(id);
+  }, [lockedUntil]);
 
-    if (!email.trim()) {
-      newErrors.email = "Email is required";
-    } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      newErrors.email = "Please enter a valid email address";
-    }
+  const handleChange =
+    (field: Field, setter: (value: string) => void) =>
+    (e: ChangeEvent<HTMLInputElement>) => {
+      setter(e.target.value);
+      setErrors((prev) =>
+        prev[field] || prev.general ? { ...prev, [field]: undefined, general: undefined } : prev
+      );
+    };
 
-    if (!password.trim()) {
-      newErrors.password = "Password is required";
-    } else if (password.length < 6) {
-      newErrors.password = "Password must be at least 6 characters";
-    }
+  const trackCapsLock = (e: KeyboardEvent<HTMLInputElement>) =>
+    setCapsLock(e.getModifierState("CapsLock"));
 
-    setErrors(newErrors);
-    return Object.keys(newErrors).length === 0;
-  };
-
-  const handleLogin = async (e: React.FormEvent) => {
+  const handleSubmit = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
-    
-    if (!validateForm()) return;
+    if (loading || isLocked) return;
 
-    // Check login attempts
-    if (loginAttempts >= 3) {
-      setErrors({
-        general: "Too many failed attempts. Please try again after 30 seconds."
-      });
+    const cleanEmail = email.trim();
+    const fieldErrors = validate(cleanEmail, password);
+
+    if (fieldErrors.email || fieldErrors.password) {
+      setErrors(fieldErrors);
+      (fieldErrors.email ? emailRef : passwordRef).current?.focus();
       return;
     }
 
-    try {
-      setLoading(true);
-      await signInWithEmailAndPassword(auth, email, password);
-      // Reset login attempts on successful login
-      setLoginAttempts(0);
-      navigate("/admin/dashboard");
-    } catch (error: any) {
-      const attempts = loginAttempts + 1;
-      setLoginAttempts(attempts);
-      
-      let errorMessage = "Login failed. Please check your credentials.";
-      
-      switch (error.code) {
-        case "auth/invalid-credential":
-          errorMessage = "Invalid email or password";
-          break;
-        case "auth/user-not-found":
-          errorMessage = "No account found with this email";
-          break;
-        case "auth/wrong-password":
-          errorMessage = "Incorrect password";
-          break;
-        case "auth/too-many-requests":
-          errorMessage = "Too many login attempts. Please try again later.";
-          break;
-        case "auth/network-request-failed":
-          errorMessage = "Network error. Please check your connection.";
-          break;
-      }
+    if (!navigator.onLine) {
+      setErrors({ general: ERROR_MESSAGES["auth/network-request-failed"] });
+      return;
+    }
 
-      setErrors({ general: errorMessage });
-      
-      // Auto-clear error after 5 seconds
-      setTimeout(() => {
-        setErrors(prev => ({ ...prev, general: undefined }));
-      }, 5000);
-    } finally {
+    setErrors({});
+    setLoading(true);
+
+    try {
+      await signInWithEmailAndPassword(auth, cleanEmail, password);
+      // onAuthStateChanged handles the redirect, so the spinner stays until we leave.
+    } catch (err) {
+      const code = (err as FirebaseError).code;
+
+      if (CREDENTIAL_ERRORS.has(code)) {
+        const next = attempts + 1;
+        setAttempts(next);
+        setPassword("");
+        passwordRef.current?.focus();
+
+        if (next >= MAX_ATTEMPTS) {
+          const until = Date.now() + LOCK_SECONDS * 1000;
+          setLockedUntil(until);
+          writeLock(until);
+        }
+        setErrors({ general: DEFAULT_ERROR });
+      } else {
+        // Network or server problems are not the user's fault, so they don't count as attempts.
+        setErrors({ general: ERROR_MESSAGES[code] ?? FALLBACK_ERROR });
+      }
       setLoading(false);
     }
   };
 
-  const handleKeyPress = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !loading) {
-      handleLogin(e);
-    }
-  };
+  if (checkingAuth) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-slate-50" role="status">
+        <Loader2 className="h-6 w-6 animate-spin text-slate-400" aria-label="Loading" />
+      </div>
+    );
+  }
+
+  const attemptsLeft = MAX_ATTEMPTS - attempts;
+  const showWarning = errors.general && attempts > 0 && !isLocked;
 
   return (
-    <div className="min-h-screen bg-gray-50 flex items-center justify-center p-4">
-      <div className="w-full max-w-lg">
-        <div className="bg-white rounded-2xl shadow-lg overflow-hidden border border-gray-200">
-          {/* Header */}
-          <div className="bg-gradient-to-r from-gray-900 to-gray-800 p-6 text-center">
-            <div className="flex items-center justify-center space-x-3 mb-4">
-              <div className="bg-blue-500 p-2 rounded-lg">
-                <Shield className="h-8 w-8 text-white" />
-              </div>
-              <h1 className="text-2xl font-bold text-white">Admin Portal</h1>
+    <main className="flex min-h-screen items-center justify-center bg-slate-50 px-4 py-10">
+      <div className="w-full max-w-md">
+        <div className="rounded-2xl border border-slate-200 bg-white p-8 shadow-sm sm:p-10">
+          <img src={adminLogo} alt="Admin portal" className="mx-auto mb-8 h-12 w-auto" />
+
+          <h1 className="text-center text-2xl font-semibold text-slate-900">Sign in</h1>
+          <p className="mt-1.5 text-center text-sm text-slate-500">
+            Use your admin account to open the dashboard.
+          </p>
+
+          {isLocked && (
+            <div className="mt-6 flex items-start gap-2.5 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
+              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
+              <p>Too many failed attempts. Try again in {secondsLeft}s.</p>
             </div>
-            <p className="text-gray-300 text-sm">Secure access to management dashboard</p>
-          </div>
+          )}
 
-          <div className="p-8">
-            {/* Login attempts warning */}
-            {loginAttempts > 0 && loginAttempts < 3 && (
-              <div className="mb-6 p-3 bg-yellow-50 border border-yellow-200 rounded-lg">
-                <p className="text-yellow-800 text-sm flex items-center">
-                  <AlertCircle className="h-4 w-4 mr-2" />
-                  {loginAttempts} failed attempt{loginAttempts > 1 ? 's' : ''}. {3 - loginAttempts} remaining.
-                </p>
-              </div>
-            )}
-
-            {/* General error */}
-            {errors.general && (
-              <div className="mb-6 p-3 bg-red-50 border border-red-200 rounded-lg">
-                <p className="text-red-800 text-sm flex items-center">
-                  <AlertCircle className="h-4 w-4 mr-2" />
-                  {errors.general}
-                </p>
-              </div>
-            )}
-
-            <form onSubmit={handleLogin} className="space-y-5">
-              {/* Email field */}
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Email Address
-                </label>
-                <div className="relative">
-                  <input
-                    type="email"
-                    placeholder="admin@example.com"
-                    value={email}
-                    onChange={(e) => setEmail(e.target.value)}
-                    onKeyPress={handleKeyPress}
-                    className={`w-full px-4 py-3 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all ${
-                      errors.email ? 'border-red-300 bg-red-50' : 'border-gray-300'
-                    }`}
-                    required
-                    disabled={loading}
-                  />
-                  {errors.email && (
-                    <span className="absolute right-3 top-3.5">
-                      <AlertCircle className="h-5 w-5 text-red-500" />
-                    </span>
-                  )}
-                </div>
-                {errors.email && (
-                  <p className="mt-1 text-sm text-red-600">{errors.email}</p>
-                )}
-              </div>
-
-              {/* Password field */}
-              <div>
-                <div className="flex items-center justify-between mb-1">
-                  <label className="block text-sm font-medium text-gray-700">
-                    Password
-                  </label>
-                  <button
-                    type="button"
-                    onClick={() => setShowPassword(!showPassword)}
-                    className="text-sm text-blue-600 hover:text-blue-800"
-                    disabled={loading}
-                  >
-                    {showPassword ? 'Hide' : 'Show'}
-                  </button>
-                </div>
-                <div className="relative">
-                  <input
-                    type={showPassword ? "text" : "password"}
-                    placeholder="Enter your password"
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    onKeyPress={handleKeyPress}
-                    className={`w-full px-4 py-3 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all ${
-                      errors.password ? 'border-red-300 bg-red-50' : 'border-gray-300'
-                    }`}
-                    required
-                    disabled={loading}
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowPassword(!showPassword)}
-                    className="absolute right-3 top-3.5 text-gray-500 hover:text-gray-700"
-                    disabled={loading}
-                  >
-                    {showPassword ? (
-                      <EyeOff className="h-5 w-5" />
-                    ) : (
-                      <Eye className="h-5 w-5" />
-                    )}
-                  </button>
-                </div>
-                {errors.password && (
-                  <p className="mt-1 text-sm text-red-600">{errors.password}</p>
-                )}
-              </div>
-
-              {/* Security note */}
-              <div className="bg-gray-50 p-3 rounded-lg border border-gray-200">
-                <p className="text-xs text-gray-600">
-                  <strong>Security Note:</strong> Ensure you're on the official admin portal. 
-                  Never share your credentials.
-                </p>
-              </div>
-
-              {/* Submit button */}
-              <button
-                type="submit"
-                disabled={loading || loginAttempts >= 3}
-                className="w-full py-3.5 px-4 bg-gradient-to-r from-gray-900 to-gray-800 text-white font-semibold rounded-lg hover:from-gray-800 hover:to-gray-900 focus:outline-none focus:ring-2 focus:ring-gray-900 focus:ring-offset-2 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                {loading ? (
-                  <span className="flex items-center justify-center">
-                    <svg className="animate-spin h-5 w-5 mr-3 text-white" viewBox="0 0 24 24">
-                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                    </svg>
-                    Authenticating...
+          {errors.general && !isLocked && (
+            <div
+              role="alert"
+              className="mt-6 flex items-start gap-2.5 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800"
+            >
+              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
+              <p>
+                {errors.general}
+                {showWarning && (
+                  <span className="block text-red-700/80">
+                    {attemptsLeft} attempt{attemptsLeft === 1 ? "" : "s"} left before a {LOCK_SECONDS}-second lock.
                   </span>
-                ) : (
-                  'Sign In to Dashboard'
                 )}
-              </button>
-            </form>
-
-            {/* Footer */}
-            <div className="mt-8 pt-6 border-t border-gray-200">
-              <div className="text-center">
-                <p className="text-xs text-gray-500 mb-2">
-                  {loginAttempts > 0 && (
-                    <span className="block mb-1">
-                      Failed attempts: {loginAttempts}/3
-                    </span>
-                  )}
-                  <span className="block">
-                    © {new Date().getFullYear()} Admin Portal v2.1
-                  </span>
-                </p>
-                <p className="text-xs text-gray-400">
-                  Unauthorized access is prohibited
-                </p>
-              </div>
+              </p>
             </div>
-          </div>
+          )}
+
+          <form onSubmit={handleSubmit} noValidate className="mt-6 space-y-5">
+            <div>
+              <label htmlFor="email" className="mb-1.5 block text-sm font-medium text-slate-700">
+                Email
+              </label>
+              <input
+                ref={emailRef}
+                id="email"
+                type="email"
+                inputMode="email"
+                autoComplete="username"
+                autoFocus
+                placeholder="admin@example.com"
+                value={email}
+                onChange={handleChange("email", setEmail)}
+                disabled={loading}
+                aria-invalid={!!errors.email}
+                aria-describedby={errors.email ? "email-error" : undefined}
+                className={inputClass(!!errors.email)}
+              />
+              {errors.email && (
+                <p id="email-error" className="mt-1.5 text-sm text-red-600">
+                  {errors.email}
+                </p>
+              )}
+            </div>
+
+            <div>
+              <label htmlFor="password" className="mb-1.5 block text-sm font-medium text-slate-700">
+                Password
+              </label>
+              <div className="relative">
+                <input
+                  ref={passwordRef}
+                  id="password"
+                  type={showPassword ? "text" : "password"}
+                  autoComplete="current-password"
+                  placeholder="Enter your password"
+                  value={password}
+                  onChange={handleChange("password", setPassword)}
+                  onKeyDown={trackCapsLock}
+                  onKeyUp={trackCapsLock}
+                  onBlur={() => setCapsLock(false)}
+                  disabled={loading}
+                  aria-invalid={!!errors.password}
+                  aria-describedby={errors.password ? "password-error" : undefined}
+                  className={`${inputClass(!!errors.password)} pr-11`}
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword((v) => !v)}
+                  disabled={loading}
+                  aria-label={showPassword ? "Hide password" : "Show password"}
+                  aria-pressed={showPassword}
+                  className="absolute inset-y-0 right-0 flex w-11 items-center justify-center rounded-r-lg text-slate-400 transition hover:text-slate-700 focus-visible:text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-200"
+                >
+                  {showPassword ? <EyeOff className="h-5 w-5" /> : <Eye className="h-5 w-5" />}
+                </button>
+              </div>
+              {errors.password && (
+                <p id="password-error" className="mt-1.5 text-sm text-red-600">
+                  {errors.password}
+                </p>
+              )}
+              {capsLock && !errors.password && (
+                <p className="mt-1.5 text-sm text-amber-700">Caps Lock is on.</p>
+              )}
+            </div>
+
+            <button
+              type="submit"
+              disabled={loading || isLocked}
+              className="flex w-full items-center justify-center gap-2 rounded-lg bg-slate-900 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {loading && <Loader2 className="h-4 w-4 animate-spin" aria-hidden />}
+              {loading ? "Signing in…" : isLocked ? `Try again in ${secondsLeft}s` : "Sign in"}
+            </button>
+          </form>
         </div>
+
+        <p className="mt-6 text-center text-xs text-slate-400">
+          © {YEAR} Admin Portal. Authorized staff only.
+        </p>
       </div>
-    </div>
+    </main>
   );
 }
