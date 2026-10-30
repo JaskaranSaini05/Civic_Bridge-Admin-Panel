@@ -3,18 +3,15 @@ import { getFirestore } from "firebase/firestore";
 import { getAuth } from "firebase/auth";
 
 const firebaseConfig = {
-  // your config
-  apiKey: "AIzaSyBnrcJBu918P2GcpEqaxI7NK0nz7WszAJI",
-  authDomain: "civic-bridge-83dbd.firebaseapp.com",
-  projectId: "civic-bridge-83dbd",
-  storageBucket: "civic-bridge-83dbd.firebasestorage.app",
-  messagingSenderId: "543917276390",
-  appId: "1:543917276390:web:8c73bdd48f319948aa0f27"
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+  appId: import.meta.env.VITE_FIREBASE_APP_ID
 };
 
 export const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app);
 export const auth = getAuth(app);
-
-// ✅ SECOND AUTH INSTANCE (fix logout problem)
 export const secondaryAuth = getAuth(initializeApp(firebaseConfig, "secondary"));
