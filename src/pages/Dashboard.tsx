@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { collection, getDocs, orderBy, query, Timestamp } from "firebase/firestore";
 import { db } from "../firebase/firebase";
 import {
@@ -8,7 +8,12 @@ import {
   CheckCircle2,
   RefreshCw,
   Search,
+  type LucideIcon,
 } from "lucide-react";
+
+type DateValue = Timestamp | Date | null | undefined;
+type StatusFilter = "all" | "Pending" | "Assigned" | "In Progress" | "Resolved";
+type DateFilter = "all" | "today" | "week" | "month";
 
 type Complaint = {
   id: string;
@@ -16,18 +21,28 @@ type Complaint = {
   category?: string;
   address?: string;
   status?: string;
-  userId?: string;
   userName?: string;
   userEmail?: string;
-  createdAt?: Timestamp | Date | null;
-  updatedAt?: Timestamp | Date | null;
-  assignedTo?: string;
-  assignedTechName?: string;
+  createdAt?: DateValue;
+  updatedAt?: DateValue;
+};
+
+type StatCard = {
+  title: string;
+  value: number;
+  icon: LucideIcon;
+  tone: string;
+  note: string;
 };
 
 const DAY_MS = 1000 * 60 * 60 * 24;
 const OVERDUE_DAYS = 3;
 const TABLE_LIMIT = 10;
+const CHART_HEIGHT = 96;
+
+const PANEL = "rounded-xl border border-slate-200 bg-white shadow-sm";
+const CONTROL =
+  "rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 transition-colors focus:border-blue-600 focus:outline-none focus:ring-2 focus:ring-blue-600/20";
 
 const STATUS_STYLES: Record<string, string> = {
   Pending: "bg-amber-50 text-amber-700 border-amber-200",
@@ -47,11 +62,10 @@ const CATEGORY_COLORS: Record<string, string> = {
   Other: "bg-gray-500",
 };
 
-function toDate(value: any): Date | null {
+function toDate(value: DateValue): Date | null {
   if (!value) return null;
   if (value instanceof Date) return value;
-  if (value?.toDate) return value.toDate();
-  return null;
+  return typeof value.toDate === "function" ? value.toDate() : null;
 }
 
 function daysBetween(from: Date, to: Date) {
@@ -71,12 +85,16 @@ function formatDate(date: Date | null) {
   });
 }
 
+function formatAge(days: number) {
+  if (days === 0) return "Today";
+  return days === 1 ? "1 day ago" : `${days} days ago`;
+}
+
 function getCategoryColor(category?: string) {
   return CATEGORY_COLORS[category || "Other"] || CATEGORY_COLORS.Other;
 }
 
-// Returns the earliest allowed creation date for a date filter, or null for "all"
-function getDateCutoff(dateFilter: string): Date | null {
+function getDateCutoff(dateFilter: DateFilter): Date | null {
   const now = new Date();
   if (dateFilter === "today") return startOfDay(now);
   if (dateFilter === "week") return new Date(now.getTime() - 7 * DAY_MS);
@@ -89,64 +107,64 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState("");
-  const [statusFilter, setStatusFilter] = useState("all");
-  const [dateFilter, setDateFilter] = useState("all");
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
+  const [dateFilter, setDateFilter] = useState<DateFilter>("all");
+  const isMounted = useRef(true);
 
-  const fetchComplaints = async () => {
+  const fetchComplaints = useCallback(async () => {
     try {
       setLoading(true);
       setError(null);
       const q = query(collection(db, "complaints"), orderBy("createdAt", "desc"));
       const snap = await getDocs(q);
-      setComplaints(snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) })));
+      if (!isMounted.current) return;
+      setComplaints(
+        snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<Complaint, "id">) }))
+      );
     } catch (err) {
       console.error("Error fetching complaints:", err);
-      setError("Could not load complaints. Please check your connection and try again.");
+      if (isMounted.current) {
+        setError("Could not load complaints. Please check your connection and try again.");
+      }
     } finally {
-      setLoading(false);
+      if (isMounted.current) setLoading(false);
     }
-  };
-
-  useEffect(() => {
-    fetchComplaints();
   }, []);
 
-  // Statistics only depend on the full list, so they are not recalculated while typing in search
+  useEffect(() => {
+    isMounted.current = true;
+    fetchComplaints();
+    return () => {
+      isMounted.current = false;
+    };
+  }, [fetchComplaints]);
+
   const stats = useMemo(() => {
     const now = new Date();
     const today = startOfDay(now);
 
-    let pending = 0;
-    let assigned = 0;
-    let inProgress = 0;
-    let resolved = 0;
+    const statusCounts: Record<string, number> = {};
+    const categoryCounts: Record<string, number> = {};
     let overdue = 0;
     let resolutionDaysTotal = 0;
     let resolutionCount = 0;
-    const categoryCounts: Record<string, number> = {};
 
     // Index 0 is six days ago, index 6 is today
     const weekly = Array.from({ length: 7 }, (_, i) => {
       const date = new Date(today.getFullYear(), today.getMonth(), today.getDate() - (6 - i));
       return {
         day: date.toLocaleDateString("en-US", { weekday: "short" }),
-        date: date.getDate(),
         count: 0,
       };
     });
 
     for (const c of complaints) {
       const status = c.status || "Pending";
-      const created = toDate(c.createdAt);
-
-      if (status === "Pending") pending++;
-      else if (status === "Assigned") assigned++;
-      else if (status === "In Progress") inProgress++;
-      else if (status === "Resolved") resolved++;
-
       const category = c.category || "Other";
+      statusCounts[status] = (statusCounts[status] || 0) + 1;
       categoryCounts[category] = (categoryCounts[category] || 0) + 1;
 
+      const created = toDate(c.createdAt);
       if (!created) continue;
 
       if (status !== "Resolved" && status !== "In Progress" && daysBetween(created, now) > OVERDUE_DAYS) {
@@ -172,10 +190,10 @@ export default function Dashboard() {
 
     return {
       total: complaints.length,
-      pending,
-      assigned,
-      inProgress,
-      resolved,
+      pending: statusCounts["Pending"] || 0,
+      assigned: statusCounts["Assigned"] || 0,
+      inProgress: statusCounts["In Progress"] || 0,
+      resolved: statusCounts["Resolved"] || 0,
       overdue,
       avgResolution: resolutionCount > 0 ? Math.round(resolutionDaysTotal / resolutionCount) : null,
       categories,
@@ -184,198 +202,235 @@ export default function Dashboard() {
     };
   }, [complaints]);
 
-  const search = searchTerm.trim().toLowerCase();
-  const cutoff = getDateCutoff(dateFilter);
+  const filteredComplaints = useMemo(() => {
+    const term = searchTerm.trim().toLowerCase();
+    const cutoff = getDateCutoff(dateFilter);
 
-  const filteredComplaints = complaints.filter((c) => {
-    if (statusFilter !== "all" && (c.status || "Pending") !== statusFilter) return false;
+    return complaints.filter((c) => {
+      if (statusFilter !== "all" && (c.status || "Pending") !== statusFilter) return false;
 
-    if (cutoff) {
-      const created = toDate(c.createdAt);
-      if (!created || created < cutoff) return false;
-    }
+      if (cutoff) {
+        const created = toDate(c.createdAt);
+        if (!created || created < cutoff) return false;
+      }
 
-    if (!search) return true;
-    return [c.title, c.category, c.address, c.userName].some((field) =>
-      field?.toLowerCase().includes(search)
-    );
-  });
+      if (!term) return true;
+      return [c.title, c.category, c.address, c.userName].some((field) =>
+        field?.toLowerCase().includes(term)
+      );
+    });
+  }, [complaints, searchTerm, statusFilter, dateFilter]);
 
   const recentComplaints = filteredComplaints.slice(0, TABLE_LIMIT);
   const now = new Date();
+  const showContent = !loading && (complaints.length > 0 || !error);
 
   const percentOfTotal = (count: number) =>
     stats.total > 0 ? Math.round((count / stats.total) * 100) : 0;
 
-  const cards = [
-    { title: "Total Complaints", value: stats.total, icon: ClipboardList, note: "" },
-    { title: "Pending", value: stats.pending, icon: Hourglass, note: `${percentOfTotal(stats.pending)}% of total` },
-    { title: "In Progress", value: stats.inProgress, icon: Wrench, note: `${percentOfTotal(stats.inProgress)}% of total` },
-    { title: "Resolved", value: stats.resolved, icon: CheckCircle2, note: `${percentOfTotal(stats.resolved)}% resolution rate` },
+  const cards: StatCard[] = [
+    {
+      title: "Total complaints",
+      value: stats.total,
+      icon: ClipboardList,
+      tone: "bg-slate-100 text-slate-600",
+      note: "All reported issues",
+    },
+    {
+      title: "Pending",
+      value: stats.pending,
+      icon: Hourglass,
+      tone: "bg-amber-50 text-amber-600",
+      note: `${percentOfTotal(stats.pending)}% of total`,
+    },
+    {
+      title: "In progress",
+      value: stats.inProgress,
+      icon: Wrench,
+      tone: "bg-blue-50 text-blue-600",
+      note: `${percentOfTotal(stats.inProgress)}% of total`,
+    },
+    {
+      title: "Resolved",
+      value: stats.resolved,
+      icon: CheckCircle2,
+      tone: "bg-emerald-50 text-emerald-600",
+      note: `${percentOfTotal(stats.resolved)}% resolution rate`,
+    },
   ];
 
   const quickStats = [
     { label: "Overdue (over 3 days)", value: stats.overdue },
-    { label: "Avg. Resolution Time", value: stats.avgResolution === null ? "-" : `${stats.avgResolution} days` },
+    { label: "Avg. resolution time", value: stats.avgResolution === null ? "-" : `${stats.avgResolution} days` },
     { label: "Assigned", value: stats.assigned },
-    { label: "New Today", value: stats.weekly[6].count },
+    { label: "New today", value: stats.weekly[6].count },
   ];
 
   return (
-    <div className="min-h-screen bg-white">
-      <div className="max-w-7xl mx-auto px-4 py-6 space-y-6">
-        {/* Header */}
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-          <h1 className="text-2xl font-semibold text-gray-900">Dashboard Overview</h1>
-
-          <div className="flex items-center gap-3 flex-wrap">
-            <div className="relative">
-              <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 w-4 h-4" />
-              <input
-                type="text"
-                placeholder="Search complaints..."
-                value={searchTerm}
-                onChange={(e) => setSearchTerm(e.target.value)}
-                className="pl-9 pr-3 py-2 border border-gray-300 rounded text-sm w-64 focus:outline-none focus:border-blue-500"
-              />
-            </div>
-
-            <button
-              onClick={fetchComplaints}
-              disabled={loading}
-              className="flex items-center gap-2 px-4 py-2 rounded bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 disabled:opacity-60 disabled:cursor-not-allowed"
-            >
-              <RefreshCw className={`w-4 h-4 ${loading ? "animate-spin" : ""}`} />
-              Refresh
-            </button>
+    <div className="min-h-screen bg-slate-50">
+      <div className="mx-auto max-w-7xl space-y-6 px-4 py-6 sm:px-6 lg:px-8 lg:py-8">
+        <header className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <h1 className="text-2xl font-semibold tracking-tight text-slate-900">Dashboard overview</h1>
+            <p className="mt-1 text-sm text-slate-600">
+              Track citizen-reported issues and how quickly they are resolved.
+            </p>
           </div>
-        </div>
 
-        {/* Filters */}
-        <div className="flex flex-wrap items-center gap-3 text-sm">
-          <select
-            value={statusFilter}
-            onChange={(e) => setStatusFilter(e.target.value)}
-            className="px-3 py-2 border border-gray-300 rounded bg-white focus:outline-none focus:border-blue-500"
+          <button
+            type="button"
+            onClick={fetchComplaints}
+            disabled={loading}
+            className="inline-flex items-center justify-center gap-2 rounded-lg bg-blue-700 px-4 py-2 text-sm font-medium text-white shadow-sm transition-colors hover:bg-blue-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-600 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60"
           >
-            <option value="all">All Status</option>
-            <option value="Pending">Pending</option>
-            <option value="Assigned">Assigned</option>
-            <option value="In Progress">In Progress</option>
-            <option value="Resolved">Resolved</option>
-          </select>
-
-          <select
-            value={dateFilter}
-            onChange={(e) => setDateFilter(e.target.value)}
-            className="px-3 py-2 border border-gray-300 rounded bg-white focus:outline-none focus:border-blue-500"
-          >
-            <option value="all">All Time</option>
-            <option value="today">Today</option>
-            <option value="week">Last 7 Days</option>
-            <option value="month">Last 30 Days</option>
-          </select>
-        </div>
+            <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
+            Refresh
+          </button>
+        </header>
 
         {error && (
-          <div className="border border-red-200 bg-red-50 text-red-700 text-sm rounded px-4 py-3">
+          <div role="alert" className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
             {error}
           </div>
         )}
 
-        {loading ? (
-          <div className="border border-gray-200 rounded p-12 text-center text-gray-600">
+        {loading && (
+          <div role="status" className={`${PANEL} p-12 text-center text-sm text-slate-600`}>
             Loading dashboard data...
           </div>
-        ) : (
-          <>
-            {/* Stats cards */}
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-              {cards.map((card) => {
-                const Icon = card.icon;
-                return (
-                  <div key={card.title} className="border border-gray-200 rounded p-4">
-                    <div className="flex items-start justify-between">
-                      <div>
-                        <p className="text-sm text-gray-600">{card.title}</p>
-                        <p className="text-3xl font-semibold text-gray-900 mt-1">{card.value}</p>
-                      </div>
-                      <Icon className="w-5 h-5 text-gray-400" />
-                    </div>
-                    {card.note && <p className="text-xs text-gray-500 mt-3">{card.note}</p>}
-                  </div>
-                );
-              })}
-            </div>
+        )}
 
-            {/* Quick stats, categories, weekly activity */}
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-              <div className="border border-gray-200 rounded p-4">
-                <h3 className="font-semibold text-gray-900 mb-4">Quick Stats</h3>
-                <div className="divide-y divide-gray-100">
+        {showContent && (
+          <>
+            <section aria-label="Complaint totals" className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+              {cards.map(({ title, value, icon: Icon, tone, note }) => (
+                <div key={title} className={`${PANEL} p-5`}>
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-medium text-slate-600">{title}</p>
+                      <p className="mt-2 text-3xl font-semibold tracking-tight text-slate-900">{value}</p>
+                    </div>
+                    <span className={`rounded-lg p-2 ${tone}`}>
+                      <Icon className="h-5 w-5" aria-hidden="true" />
+                    </span>
+                  </div>
+                  <p className="mt-3 text-xs text-slate-500">{note}</p>
+                </div>
+              ))}
+            </section>
+
+            <section className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+              <div className={`${PANEL} p-5`}>
+                <h2 className="mb-3 text-base font-semibold text-slate-900">Quick stats</h2>
+                <dl className="divide-y divide-slate-100">
                   {quickStats.map((stat) => (
-                    <div key={stat.label} className="flex items-center justify-between py-2.5 text-sm">
-                      <span className="text-gray-600">{stat.label}</span>
-                      <span className="font-semibold text-gray-900">{stat.value}</span>
+                    <div key={stat.label} className="flex items-center justify-between py-3 text-sm">
+                      <dt className="text-slate-600">{stat.label}</dt>
+                      <dd className="font-semibold text-slate-900">{stat.value}</dd>
                     </div>
                   ))}
-                </div>
+                </dl>
               </div>
 
-              <div className="border border-gray-200 rounded p-4">
-                <h3 className="font-semibold text-gray-900 mb-4">Top Categories</h3>
+              <div className={`${PANEL} p-5`}>
+                <h2 className="mb-4 text-base font-semibold text-slate-900">Top categories</h2>
                 {stats.categories.length === 0 ? (
-                  <p className="text-sm text-gray-500">No data yet</p>
+                  <p className="text-sm text-slate-500">No data yet</p>
                 ) : (
-                  <div className="space-y-3">
+                  <ul className="space-y-4">
                     {stats.categories.map((cat) => (
-                      <div key={cat.name}>
-                        <div className="flex items-center justify-between text-sm mb-1">
-                          <span className="text-gray-700">{cat.name}</span>
-                          <span className="font-medium text-gray-900">{cat.count}</span>
+                      <li key={cat.name}>
+                        <div className="mb-1.5 flex items-center justify-between text-sm">
+                          <span className="text-slate-700">{cat.name}</span>
+                          <span className="font-medium text-slate-900">{cat.count}</span>
                         </div>
-                        <div className="w-full bg-gray-100 rounded-full h-1.5">
+                        <div className="h-1.5 w-full rounded-full bg-slate-100">
                           <div
-                            className={`${getCategoryColor(cat.name)} h-1.5 rounded-full`}
+                            className={`h-1.5 rounded-full ${getCategoryColor(cat.name)}`}
                             style={{ width: `${(cat.count / stats.total) * 100}%` }}
                           />
                         </div>
-                      </div>
+                      </li>
                     ))}
-                  </div>
+                  </ul>
                 )}
               </div>
 
-              <div className="border border-gray-200 rounded p-4">
-                <h3 className="font-semibold text-gray-900 mb-4">Last 7 Days</h3>
+              <div className={`${PANEL} p-5`}>
+                <h2 className="mb-4 text-base font-semibold text-slate-900">Last 7 days</h2>
                 <div className="flex items-end gap-2">
-                  {stats.weekly.map((day) => (
-                    <div key={day.day + day.date} className="flex-1 flex flex-col items-center justify-end">
-                      <span className="text-xs text-gray-700 mb-1">{day.count}</span>
+                  {stats.weekly.map((day, index) => (
+                    <div key={day.day} className="flex flex-1 flex-col items-center justify-end">
+                      <span className="mb-1 text-xs font-medium text-slate-700">{day.count}</span>
                       <div
-                        className="w-full bg-blue-500 rounded-sm"
-                        style={{ height: `${Math.max(2, Math.round((day.count / stats.weeklyMax) * 80))}px` }}
+                        className={`w-full rounded-t ${index === 6 ? "bg-blue-700" : "bg-blue-200"}`}
+                        style={{
+                          height: `${Math.max(3, Math.round((day.count / stats.weeklyMax) * CHART_HEIGHT))}px`,
+                        }}
                       />
-                      <span className="text-xs text-gray-500 mt-2">{day.day}</span>
+                      <span className="mt-2 text-xs text-slate-500">{day.day}</span>
                     </div>
                   ))}
                 </div>
               </div>
-            </div>
+            </section>
 
-            {/* Recent complaints */}
-            <div className="border border-gray-200 rounded overflow-hidden">
-              <div className="px-4 py-3 border-b border-gray-200 flex items-center justify-between">
-                <h2 className="font-semibold text-gray-900">Recent Complaints</h2>
-                <span className="text-sm text-gray-500">
-                  Showing {recentComplaints.length} of {filteredComplaints.length}
-                </span>
+            <section className={`${PANEL} overflow-hidden`}>
+              <div className="flex flex-col gap-4 border-b border-slate-200 p-5 lg:flex-row lg:items-center lg:justify-between">
+                <div>
+                  <h2 className="text-base font-semibold text-slate-900">Recent complaints</h2>
+                  <p className="mt-0.5 text-sm text-slate-500">
+                    Showing {recentComplaints.length} of {filteredComplaints.length}
+                  </p>
+                </div>
+
+                <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center">
+                  <div className="relative">
+                    <Search
+                      className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400"
+                      aria-hidden="true"
+                    />
+                    <input
+                      type="search"
+                      aria-label="Search complaints"
+                      placeholder="Search complaints..."
+                      value={searchTerm}
+                      onChange={(e) => setSearchTerm(e.target.value)}
+                      className={`${CONTROL} w-full pl-9 sm:w-64`}
+                    />
+                  </div>
+
+                  <select
+                    aria-label="Filter by status"
+                    value={statusFilter}
+                    onChange={(e) => setStatusFilter(e.target.value as StatusFilter)}
+                    className={CONTROL}
+                  >
+                    <option value="all">All status</option>
+                    <option value="Pending">Pending</option>
+                    <option value="Assigned">Assigned</option>
+                    <option value="In Progress">In progress</option>
+                    <option value="Resolved">Resolved</option>
+                  </select>
+
+                  <select
+                    aria-label="Filter by date"
+                    value={dateFilter}
+                    onChange={(e) => setDateFilter(e.target.value as DateFilter)}
+                    className={CONTROL}
+                  >
+                    <option value="all">All time</option>
+                    <option value="today">Today</option>
+                    <option value="week">Last 7 days</option>
+                    <option value="month">Last 30 days</option>
+                  </select>
+                </div>
               </div>
 
               {filteredComplaints.length === 0 ? (
-                <div className="p-10 text-center">
-                  <p className="text-gray-700 font-medium">No complaints found</p>
-                  <p className="text-gray-500 text-sm mt-1">
+                <div className="p-12 text-center">
+                  <p className="font-medium text-slate-800">No complaints found</p>
+                  <p className="mt-1 text-sm text-slate-500">
                     {complaints.length === 0
                       ? "Complaints will appear here once submitted"
                       : "Try changing the search or filters"}
@@ -383,52 +438,50 @@ export default function Dashboard() {
                 </div>
               ) : (
                 <div className="overflow-x-auto">
-                  <table className="w-full text-sm">
-                    <thead className="bg-gray-50 text-left text-xs font-semibold text-gray-600 uppercase">
+                  <table className="w-full min-w-[720px] text-sm">
+                    <thead className="bg-slate-50 text-left text-xs font-medium text-slate-600">
                       <tr>
-                        <th className="px-4 py-3">Complaint</th>
-                        <th className="px-4 py-3">User</th>
-                        <th className="px-4 py-3">Category</th>
-                        <th className="px-4 py-3">Date</th>
-                        <th className="px-4 py-3">Status</th>
+                        <th scope="col" className="px-5 py-3">Complaint</th>
+                        <th scope="col" className="px-5 py-3">User</th>
+                        <th scope="col" className="px-5 py-3">Category</th>
+                        <th scope="col" className="px-5 py-3">Date</th>
+                        <th scope="col" className="px-5 py-3">Status</th>
                       </tr>
                     </thead>
-                    <tbody className="divide-y divide-gray-200">
+                    <tbody className="divide-y divide-slate-100">
                       {recentComplaints.map((c) => {
                         const createdDate = toDate(c.createdAt);
                         const status = c.status || "Pending";
 
                         return (
-                          <tr key={c.id} className="hover:bg-gray-50">
-                            <td className="px-4 py-3">
-                              <p className="font-medium text-gray-900">{c.title || "No Title"}</p>
-                              <p className="text-gray-500 truncate max-w-xs">{c.address || "No address"}</p>
+                          <tr key={c.id} className="transition-colors hover:bg-slate-50">
+                            <td className="px-5 py-4">
+                              <p className="font-medium text-slate-900">{c.title || "No title"}</p>
+                              <p className="max-w-xs truncate text-slate-500">{c.address || "No address"}</p>
                             </td>
 
-                            <td className="px-4 py-3">
-                              <p className="text-gray-900">{c.userName || "Anonymous"}</p>
-                              <p className="text-gray-500 truncate max-w-xs">{c.userEmail || "No email"}</p>
+                            <td className="px-5 py-4">
+                              <p className="text-slate-900">{c.userName || "Anonymous"}</p>
+                              <p className="max-w-xs truncate text-slate-500">{c.userEmail || "No email"}</p>
                             </td>
 
-                            <td className="px-4 py-3">
-                              <span className="inline-flex items-center gap-2 text-gray-700">
-                                <span className={`w-2 h-2 rounded-full ${getCategoryColor(c.category)}`} />
+                            <td className="px-5 py-4">
+                              <span className="inline-flex items-center gap-2 text-slate-700">
+                                <span className={`h-2 w-2 rounded-full ${getCategoryColor(c.category)}`} />
                                 {c.category || "Other"}
                               </span>
                             </td>
 
-                            <td className="px-4 py-3 text-gray-700">
+                            <td className="px-5 py-4 text-slate-700">
                               <p>{formatDate(createdDate)}</p>
                               {createdDate && (
-                                <p className="text-xs text-gray-500">
-                                  {daysBetween(createdDate, now)} days ago
-                                </p>
+                                <p className="text-xs text-slate-500">{formatAge(daysBetween(createdDate, now))}</p>
                               )}
                             </td>
 
-                            <td className="px-4 py-3">
+                            <td className="px-5 py-4">
                               <span
-                                className={`inline-block px-2 py-0.5 rounded border text-xs font-medium ${
+                                className={`inline-block whitespace-nowrap rounded-full border px-2.5 py-0.5 text-xs font-medium ${
                                   STATUS_STYLES[status] || STATUS_STYLES.Pending
                                 }`}
                               >
@@ -442,7 +495,7 @@ export default function Dashboard() {
                   </table>
                 </div>
               )}
-            </div>
+            </section>
           </>
         )}
       </div>
